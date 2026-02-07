@@ -2,9 +2,7 @@
   "ssid": "YourWifiName",
   "ssid_password": "YourWifiPassword",
   "muni_api_token": "YOUR_511_API_TOKEN",
-  "stop_code": "14448",
-  "route_prefix": "N",
-  "utc_offset_hours": -8,
-  "latitude": 37.773225466683144,
-  "longitude": -122.4320950656136
+  "stop_code": "use www.sfmta.com/find-a-stop to find your stop code", 
+  "latitude": 0.0,
+  "longitude": 0.0
 }
