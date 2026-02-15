@@ -113,7 +113,7 @@ def build_error_group(layout: SimpleTextLayout, width: int = 64, height: int = 6
     try:
         from adafruit_display_text import label as _label
 
-        text = _label.Label(layout.font, text="Error", color=0xFF0000, scale=1)
+        text = _label.Label(layout.font, text="ERROR", color=0xFF0000, scale=1)
         try:
             bounds = text.bounding_box
             text.x = max(0, (width - bounds[2]) // 2)
@@ -166,6 +166,12 @@ def build_display_group(
     times: Sequence[str],
     now_epoch: Optional[int] = None,
     utc_offset_seconds: int = 0,
+    current_temperature: Optional[float] = None,
+    temperature_unit: str = "fahrenheit",
+    time_format: str = "12h",
+    time_to_stop: Optional[int] = None,
+    show_time: bool = True,
+    show_temperature: bool = True,
 ) -> displayio.Group:
     """Build the main display group from train times."""
     group = displayio.Group()
@@ -228,18 +234,32 @@ def build_display_group(
     )
     group.append(t2_group)
 
-    dot1 = build_status_dot(dot_color(minutes1), size=5)
+    dot1 = build_status_dot(dot_color(minutes1, time_to_stop=time_to_stop), size=5)
     if dot1 is not None:
         dot1.x = 1
         dot1.y = 30
         group.append(dot1)
-    dot2 = build_status_dot(dot_color(minutes2), size=5)
+    dot2 = build_status_dot(dot_color(minutes2, time_to_stop=time_to_stop), size=5)
     if dot2 is not None:
         dot2.x = 1
         dot2.y = 45
         group.append(dot2)
 
-    add_time_label(group, layout, now_epoch=now_epoch, utc_offset_seconds=utc_offset_seconds)
+    if show_time:
+        add_time_label(
+            group,
+            layout,
+            now_epoch=now_epoch,
+            utc_offset_seconds=utc_offset_seconds,
+            time_format=time_format,
+        )
+    if show_temperature:
+        add_temperature_label(
+            group,
+            layout,
+            temperature=current_temperature,
+            temperature_unit=temperature_unit,
+        )
     return group
 
 
@@ -248,6 +268,7 @@ def add_time_label(
     layout: SimpleTextLayout,
     now_epoch: Optional[int] = None,
     utc_offset_seconds: int = 0,
+    time_format: str = "12h",
 ) -> None:
     """Add the current time label to a display group."""
     try:
@@ -255,23 +276,132 @@ def add_time_label(
         if now_epoch is None:
             base_epoch += int(utc_offset_seconds)
         now_time = time.localtime(base_epoch)
-        time_text = "{}:{:02d}".format(now_time.tm_hour, now_time.tm_min)
+        hour = now_time.tm_hour
+        if str(time_format).strip().lower().startswith("12"):
+            hour = hour % 12
+            if hour == 0:
+                hour = 12
+        hour_text = str(hour)
+        minute_text = "{:02d}".format(now_time.tm_min)
         from adafruit_display_text import label as _label
 
-        time_label = _label.Label(
+        hour_label = _label.Label(
             layout.font,
-            text=time_text,
+            text=hour_text,
+            color=0xFFFFFF,
+            scale=1,
+        )
+        colon_label = _label.Label(
+            layout.font,
+            text=":",
+            color=0xFFFFFF,
+            scale=1,
+        )
+        minute_label = _label.Label(
+            layout.font,
+            text=minute_text,
+            color=0xFFFFFF,
+            scale=1,
+        )
+
+        def _char_width(ch: str) -> int:
+            if ch == "1":
+                return 3
+            try:
+                sample = _label.Label(layout.font, text=ch, color=0xFFFFFF, scale=1)
+                return sample.bounding_box[2]
+            except Exception:
+                return 5
+
+        def _text_width(text: str) -> int:
+            return sum(_char_width(ch) for ch in text)
+
+        hour_width = _text_width(hour_text)
+        colon_width = _text_width(":")
+        minute_width = _text_width(minute_text)
+        # Tighten spacing around the colon, but keep a minimum gap so it renders.
+        tight = 2
+        min_gap = 1
+        total_width = hour_width + colon_width + minute_width - (tight * 2) + min_gap
+        start_x = max(0, 64 - total_width)
+        hour_label.x = start_x
+        colon_label.x = max(0, start_x + hour_width - tight)
+        minute_label.x = max(0, colon_label.x + colon_width + min_gap)
+        # Ensure the right edge never runs past the display.
+        try:
+            minute_bounds = minute_label.bounding_box
+            right_edge = minute_label.x + minute_bounds[2] - 1
+            if right_edge > 63:
+                shift = right_edge - 63
+                hour_label.x = max(0, hour_label.x - shift)
+                colon_label.x = max(0, colon_label.x - shift)
+                minute_label.x = max(0, minute_label.x - shift)
+        except Exception:
+            pass
+
+        try:
+            max_height = max(
+                hour_label.bounding_box[3],
+                colon_label.bounding_box[3],
+                minute_label.bounding_box[3],
+            )
+        except Exception:
+            max_height = 8
+        base_y = max(0, 63 - max_height)
+        y_pos = min(63, base_y + 9)
+        hour_label.y = y_pos
+        colon_label.y = y_pos
+        minute_label.y = y_pos
+        group.append(hour_label)
+        group.append(colon_label)
+        group.append(minute_label)
+    except Exception:
+        pass
+
+
+def _format_temperature(temperature: Optional[float], temperature_unit: str) -> Optional[str]:
+    unit = (temperature_unit or "").strip().lower()
+    if unit.startswith("c"):
+        suffix = "C"
+    else:
+        suffix = "F"
+    if temperature is None:
+        return "--{}".format(suffix)
+    try:
+        value = int(round(float(temperature)))
+    except Exception:
+        return None
+    return "{}{}".format(value, suffix)
+
+
+def add_temperature_label(
+    group: displayio.Group,
+    layout: SimpleTextLayout,
+    temperature: Optional[float] = None,
+    temperature_unit: str = "fahrenheit",
+) -> None:
+    """Add the temperature label to a display group."""
+    try:
+        text = _format_temperature(temperature, temperature_unit)
+        if not text:
+            return
+        from adafruit_display_text import label as _label
+
+        temp_label = _label.Label(
+            layout.font,
+            text=text,
             color=0xFFFFFF,
             scale=1,
         )
         try:
-            time_bounds = time_label.bounding_box
-            time_label.x = max(0, 64 - time_bounds[2]) + 1
-            time_label.y = max(0, 63 - (time_bounds[3] // 2)) + 3
+            temp_bounds = temp_label.bounding_box
+            temp_label.x = max(0, 64 - temp_bounds[2] - 52)
+            base_y = max(0, 63 - temp_bounds[3])
+            temp_label.y = min(63, base_y + 9)
         except Exception:
-            time_label.x = 64 - (6 * len(time_text)) + 1
-            time_label.y = 63 - 4 + 3
-        group.append(time_label)
+            temp_label.x = max(0, 64 - (6 * len(text)) - 52)
+            temp_label.y = 63
+        group.append(temp_label)
     except Exception:
         pass
 
@@ -386,13 +516,20 @@ def parse_minutes(text: str) -> Optional[int]:
     return None
 
 
-def dot_color(minutes: Optional[int]) -> int:
+def dot_color(minutes: Optional[int], time_to_stop: Optional[int] = None) -> int:
     """Map minutes to a status color."""
     if minutes is None:
         return 0xFFFFFF
-    if minutes < 5:
+    if time_to_stop is None:
+        time_to_stop = 5
+    try:
+        stop_window = int(time_to_stop)
+    except Exception:
+        stop_window = 5
+    warn_window = stop_window + 3
+    if minutes <= stop_window:
         return 0xFF3333
-    if minutes <= 8:
+    if minutes <= warn_window:
         return 0xFFCC33
     return 0x33FF66
 

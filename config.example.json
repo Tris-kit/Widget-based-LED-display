@@ -4,5 +4,37 @@
   "muni_api_token": "YOUR_511_API_TOKEN",
   "stop_code": "use www.sfmta.com/find-a-stop to find your stop code", 
   "latitude": 0.0,
-  "longitude": 0.0
+  "longitude": 0.0,
+  "time_format": "12h",
+  "temperature_unit": "fahrenheit",
+  "time_to_stop": 5,
+  "display_brightness": 0.3,
+  "refresh_seconds": 30,
+  "request_timeout_seconds": 20,
+  "spotify_client_id": "YOUR_SPOTIFY_CLIENT_ID",
+  "spotify_client_secret": "YOUR_SPOTIFY_CLIENT_SECRET",
+  "spotify_refresh_token": "YOUR_SPOTIFY_REFRESH_TOKEN",
+  "spotify_image_proxy": "https://your-proxy.example.com/spotify-image?url={url}",
+  "spotify_refresh_seconds": 15,
+  "spotify_request_timeout_seconds": 15,
+  "spotify_art_path": "spotify_art.bmp",
+  "button1_pin": "GP14",
+  "button2_pin": "GP15",
+  "button_active_low": true,
+  "button_hold_seconds": 0.5,
+  "announcement_duration_seconds": 10,
+  "announcement_text_color": "#FFFFFF",
+  "_announcements_cron_help": "Cron format is 5 fields: minute hour day-of-month month day-of-week. '*' means every. Example: '0 8 * * 1-5' = 08:00 on weekdays.",
+  "announcements": [
+    {
+      "label": "Welcome",
+      "cron": "* * * * *",
+      "image": "/images/welcome.bmp",
+      "x_image_offset": 0,
+      "y_image_offset": 0,
+      "duration_seconds": 10,
+      "frame_delay_seconds": 0.05,
+      "text_color": "#FFFFFF"
+    }
+  ]
 }

@@ -45,3 +45,19 @@ class RgbPanel:
             self.display.root_group = group
         except AttributeError:
             self.display.show(group)
+
+    def set_brightness(self, value: float) -> None:
+        """Set panel brightness (0.0 to 1.0), if supported."""
+        try:
+            level = float(value)
+        except Exception:
+            return
+        if level < 0.0:
+            level = 0.0
+        elif level > 1.0:
+            level = 1.0
+        try:
+            self.display.brightness = level
+        except Exception:
+            # Some display drivers don't expose brightness control.
+            pass

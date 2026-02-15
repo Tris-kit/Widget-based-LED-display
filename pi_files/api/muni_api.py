@@ -5,16 +5,51 @@ try:
 except ImportError:
     from local.typing_compat import List, Optional
 
-try:
-    from datetime import datetime as _datetime
-except ImportError:
-    _datetime = None
+from api.http_client import HttpClient
 
-import adafruit_requests
-import socketpool
-import wifi
+_DAYS_BEFORE_MONTH = (
+    0,
+    31,
+    59,
+    90,
+    120,
+    151,
+    181,
+    212,
+    243,
+    273,
+    304,
+    334,
+)
 
-from local.errors import DisplayError
+
+def _is_leap_year(year: int) -> bool:
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+
+
+def _days_before_year(year: int) -> int:
+    year -= 1
+    return (
+        365 * (year - 1969)
+        + (year // 4 - 1969 // 4)
+        - (year // 100 - 1969 // 100)
+        + (year // 400 - 1969 // 400)
+    )
+
+
+def _utc_epoch_from_parts(
+    year: int, month: int, day: int, hour: int, minute: int, second: int
+) -> Optional[int]:
+    if month < 1 or month > 12:
+        return None
+    if day < 1 or day > 31:
+        return None
+    days = _days_before_year(year)
+    days += _DAYS_BEFORE_MONTH[month - 1]
+    if month > 2 and _is_leap_year(year):
+        days += 1
+    days += day - 1
+    return days * 86400 + (hour * 3600) + (minute * 60) + second
 
 
 class ArrivingTrain:
@@ -43,6 +78,8 @@ class ArrivingTrain:
 
 
 class MuniStop:
+    """Muni stop client that enqueues requests and updates its own state."""
+
     def __init__(
         self,
         stop_code: str,
@@ -54,69 +91,74 @@ class MuniStop:
         self.stop_name = ""
         self.agency = agency
         self.api_token = api_token
-        self.http_client = http_client
+        self.http_client = http_client or HttpClient()
         self.trains: List[ArrivingTrain] = []
         self.routes: List[str] = []
         self.primary_route: str = ""
+        self.response_epoch: Optional[int] = None
+        self._last_update_monotonic: Optional[float] = None
+        self.last_error: Optional[Exception] = None
+        self.fatal_error_lines: Optional[List[str]] = None
 
-    def _get_http_client(self):
-        if self.http_client is not None:
-            return self.http_client
-        # Choose the best available HTTP stack for the runtime.
-        pool = socketpool.SocketPool(wifi.radio)
-        return adafruit_requests.Session(pool)
-
-    def query_stop_data(self, on_progress=None) -> dict:
+    def request_refresh(self, on_update=None, on_error=None, on_progress=None, timeout: int = 10) -> bool:
+        """Queue a stop monitoring request."""
         if not self.api_token:
-            raise ValueError("api_token is required to query stop data")
+            err = ValueError("api_token is required to query stop data")
+            self.last_error = err
+            if on_error:
+                on_error(err)
+            return False
 
-        http_requests = self._get_http_client()
-        # 511.org StopMonitoring endpoint.
         stop_url = (
             "http://api.511.org/transit/StopMonitoring?api_key={}"
             "&agency={}&stopcode={}&format=json"
         ).format(self.api_token, self.agency, self.stop_code)
 
-        if on_progress and getattr(http_requests, "supports_progress", False):
-            response = http_requests.get(stop_url, on_progress=on_progress)
-        else:
-            response = http_requests.get(stop_url)
-        try:
-            data = response.text
-        finally:
+        def _handle_success(text, _body, _status, _headers):
             try:
-                response.close()
-            except AttributeError:
-                pass
+                payload = _safe_json_load(text)
+                self._apply_payload(payload)
+                self.last_error = None
+                if on_update:
+                    on_update()
+            except Exception as exc:
+                self.last_error = exc
+                if on_error:
+                    on_error(exc)
 
-        if isinstance(data, bytes):
-            data = data.decode("utf-8-sig")
-        else:
-            data = data.encode().decode("utf-8-sig")
+        def _handle_error(exc):
+            self.last_error = exc
+            if on_error:
+                on_error(exc)
 
-        # Some responses include leading junk or non-JSON text; trim to first JSON token.
-        trimmed = data
-        for token in ("{", "["):
-            idx = trimmed.find(token)
-            if idx != -1:
-                trimmed = trimmed[idx:]
-                break
+        return self.http_client.enqueue_get(
+            stop_url,
+            on_success=_handle_success,
+            on_error=_handle_error,
+            on_progress=on_progress,
+            timeout=timeout,
+        )
 
-        try:
-            return json.loads(trimmed)
-        except ValueError:
-            preview = trimmed[:200].replace("\n", " ")
-            print("JSON parse failed. Preview:", preview)
-            raise
-
+    # Backwards-compatible alias (now non-blocking).
     def populate_stop_data(self, on_progress=None) -> None:
-        data = self.query_stop_data(on_progress=on_progress)
+        self.request_refresh(on_progress=on_progress)
+
+    def _apply_payload(self, data: dict) -> None:
         error_message = _extract_stop_error_message(data)
         if error_message and _error_mentions_stop_code(error_message):
-            raise DisplayError(
-                "Invalid stop code.",
-                ["Bad stop code", "Update config"],
-            )
+            print("Muni API error:", error_message)
+            self.fatal_error_lines = ["Bad stop code", "Update config"]
+            self.trains = []
+            return
+        self.fatal_error_lines = None
+
+        self.response_epoch = _extract_response_epoch(
+            data, self._parse_datetime_to_epoch
+        )
+        try:
+            self._last_update_monotonic = time.monotonic()
+        except Exception:
+            self._last_update_monotonic = None
         new_trains = []
 
         delivery = data.get("ServiceDelivery", {}).get("StopMonitoringDelivery", [])
@@ -153,46 +195,55 @@ class MuniStop:
         self.routes = _unique_routes(new_trains)
         self.primary_route = _pick_primary_route(new_trains)
 
+    def get_utc_epoch(self, now_monotonic: Optional[float] = None) -> Optional[int]:
+        if self.response_epoch is None or self._last_update_monotonic is None:
+            return None
+        if now_monotonic is None:
+            try:
+                now_monotonic = time.monotonic()
+            except Exception:
+                return self.response_epoch
+        delta = int(now_monotonic - self._last_update_monotonic)
+        return self.response_epoch + max(0, delta)
+
     def _parse_datetime_to_epoch(self, datetime_str: Optional[str]) -> Optional[int]:
         if not datetime_str:
             return None
         # Expected format: 2024-01-01T12:34:56Z (UTC)
-        utc_epoch = None
-        if _datetime is not None:
-            try:
-                dt = _datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%SZ")
-                try:
-                    import calendar
+        try:
+            year = int(datetime_str[0:4])
+            month = int(datetime_str[5:7])
+            day = int(datetime_str[8:10])
+            hour = int(datetime_str[11:13])
+            minute = int(datetime_str[14:16])
+            second = int(datetime_str[17:19])
+        except (ValueError, IndexError):
+            return None
 
-                    utc_epoch = calendar.timegm(dt.timetuple())
-                except Exception:
-                    utc_epoch = time.mktime(dt.timetuple())
-            except Exception:
-                utc_epoch = None
+        return _utc_epoch_from_parts(year, month, day, hour, minute, second)
 
-        if utc_epoch is None:
-            try:
-                year = int(datetime_str[0:4])
-                month = int(datetime_str[5:7])
-                day = int(datetime_str[8:10])
-                hour = int(datetime_str[11:13])
-                minute = int(datetime_str[14:16])
-                second = int(datetime_str[17:19])
-            except (ValueError, IndexError):
-                return None
-            try:
-                import calendar
 
-                utc_epoch = calendar.timegm(
-                    (year, month, day, hour, minute, second, 0, 0, 0)
-                )
-            except Exception:
-                utc_epoch = time.mktime(
-                    (year, month, day, hour, minute, second, 0, 0, 0)
-                )
+# --- JSON helpers ---
 
-        return utc_epoch
+def _safe_json_load(text: str) -> dict:
+    cleaned = text
+    try:
+        cleaned = cleaned.encode().decode("utf-8-sig")
+    except Exception:
+        pass
+    for token in ("{", "["):
+        idx = cleaned.find(token)
+        if idx != -1:
+            cleaned = cleaned[idx:]
+            break
+    try:
+        return json.loads(cleaned)
+    except ValueError:
+        preview = cleaned[:200].replace("\n", " ")
+        raise ValueError("JSON parse failed. Preview: {}".format(preview))
 
+
+# --- Payload helpers ---
 
 def _unique_routes(trains: List[ArrivingTrain]) -> List[str]:
     seen = []
@@ -213,6 +264,33 @@ def _pick_primary_route(trains: List[ArrivingTrain]) -> str:
     if not counts:
         return ""
     return max(counts, key=counts.get)
+
+
+def _extract_response_epoch(data: dict, parser) -> Optional[int]:
+    if not isinstance(data, dict):
+        return None
+
+    service = data.get("ServiceDelivery")
+    if service is None:
+        service = data.get("Siri", {}).get("ServiceDelivery", {})
+
+    if isinstance(service, dict):
+        timestamp = service.get("ResponseTimestamp") or service.get("ResponseTimeStamp")
+        if timestamp:
+            return parser(timestamp)
+
+        delivery = service.get("StopMonitoringDelivery", [])
+        if isinstance(delivery, dict):
+            delivery = [delivery]
+        for item in delivery:
+            if not isinstance(item, dict):
+                continue
+            timestamp = item.get("ResponseTimestamp") or item.get("ResponseTimeStamp")
+            if timestamp:
+                parsed = parser(timestamp)
+                if parsed is not None:
+                    return parsed
+    return None
 
 
 def _extract_stop_error_message(data: dict) -> Optional[str]:

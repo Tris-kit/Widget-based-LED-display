@@ -78,12 +78,18 @@ class SimpleTextLayout:
         reduced = int(base_width * self.word_spacing_scale)
         return max(1, reduced)
 
-    def _build_word_group(self, line: str, scale: int) -> Tuple[displayio.Group, int]:
+    def _build_word_group(
+        self,
+        line: str,
+        scale: int,
+        color: Optional[int] = None,
+    ) -> Tuple[displayio.Group, int]:
         """Build a group for a line of text using word spacing."""
         words = line.split(" ")
         space_width = self._space_width(scale)
         total_width = 0
         word_widths = []
+        use_color = self.color if color is None else color
         for word in words:
             width = self._measure_text_width(word, scale) if word else 0
             word_widths.append(width)
@@ -94,7 +100,7 @@ class SimpleTextLayout:
         cursor_x = 0
         for index, word in enumerate(words):
             if word:
-                text = label.Label(self.font, text=word, color=self.color, scale=scale)
+                text = label.Label(self.font, text=word, color=use_color, scale=scale)
                 text.x = cursor_x
                 text.y = 0
                 line_group.append(text)
@@ -103,11 +109,17 @@ class SimpleTextLayout:
                 cursor_x += space_width
         return line_group, total_width
 
-    def _build_char_group(self, line: str, scale: int) -> Tuple[displayio.Group, int]:
+    def _build_char_group(
+        self,
+        line: str,
+        scale: int,
+        color: Optional[int] = None,
+    ) -> Tuple[displayio.Group, int]:
         """Build a group for a line of text using per-char spacing."""
         line_group = displayio.Group()
         cursor_x = 0
         prev_was_space = True
+        use_color = self.color if color is None else color
         for ch in line:
             if ch == " ":
                 # Word spacing uses a fixed 3px gap.
@@ -118,7 +130,7 @@ class SimpleTextLayout:
                 # Single-pixel gap between characters in a word.
                 cursor_x += self.letter_spacing
             _, advance, left_trim = self._glyph_metrics(ch, scale)
-            text = label.Label(self.font, text=ch, color=self.color, scale=scale)
+            text = label.Label(self.font, text=ch, color=use_color, scale=scale)
             text.x = cursor_x - left_trim
             text.y = 0
             line_group.append(text)
@@ -136,16 +148,18 @@ class SimpleTextLayout:
         align: str = "center",
         padding_right: int = 2,
         scale: Optional[int] = None,
+        color: Optional[int] = None,
     ) -> displayio.Group:
         """Build a displayio group containing the provided lines."""
         group = displayio.Group()
         cursor_y = y
         if scale is None:
             scale = self.scale
+        use_color = self.color if color is None else color
         max_width = max(0, width - x - padding_right)
         for line in lines:
             if self.letter_spacing is not None:
-                line_group, line_width = self._build_char_group(line or "", scale)
+                line_group, line_width = self._build_char_group(line or "", scale, use_color)
                 text_x = x
                 if align == "center":
                     text_x = x + max(0, (max_width - line_width) // 2)
@@ -153,7 +167,7 @@ class SimpleTextLayout:
                 line_group.y = cursor_y
                 group.append(line_group)
             elif " " in (line or "") and self.word_spacing_scale < 1:
-                line_group, line_width = self._build_word_group(line or "", scale)
+                line_group, line_width = self._build_word_group(line or "", scale, use_color)
                 text_x = x
                 if align == "center":
                     text_x = x + max(0, (max_width - line_width) // 2)
@@ -161,7 +175,7 @@ class SimpleTextLayout:
                 line_group.y = cursor_y
                 group.append(line_group)
             else:
-                text = label.Label(self.font, text=line, color=self.color, scale=scale)
+                text = label.Label(self.font, text=line, color=use_color, scale=scale)
                 text_x = x
                 if align == "center":
                     try:
