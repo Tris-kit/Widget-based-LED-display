@@ -10,9 +10,12 @@ from local.hardware.rgb_panel import RgbPanel
 from local.ui.text_layout import SimpleTextLayout
 
 
-def init_panel() -> Tuple[RgbPanel, SimpleTextLayout]:
+def init_panel(
+    bit_depth: int = 6,
+    rgb_pins=None,
+) -> Tuple[RgbPanel, SimpleTextLayout]:
     """Create and return the RGB panel and text layout."""
-    panel = RgbPanel(width=64, height=64)
+    panel = RgbPanel(width=64, height=64, bit_depth=bit_depth, rgb_pins=rgb_pins)
     layout = SimpleTextLayout()
     if displayio is not None:
         bitmap = displayio.Bitmap(64, 64, 2)
@@ -67,6 +70,11 @@ def build_loading_group(
     if displayio is None or layout is None:
         return None
     group = displayio.Group()
+    # Solid background to avoid leftover pixels flashing between frames.
+    bg_bitmap = displayio.Bitmap(width, height, 1)
+    bg_palette = displayio.Palette(1)
+    bg_palette[0] = 0x000000
+    group.append(displayio.TileGrid(bg_bitmap, pixel_shader=bg_palette))
     try:
         from adafruit_display_text import label as _label
     except Exception:

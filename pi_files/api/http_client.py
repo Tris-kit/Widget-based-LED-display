@@ -16,6 +16,28 @@ except Exception:
     ssl = None
     wifi = None
 
+_socket_pool = None
+_ssl_context = None
+
+
+def _get_socket_pool():
+    global _socket_pool
+    if _socket_pool is None:
+        if socketpool is None or wifi is None:
+            raise RuntimeError("socketpool unavailable")
+        _socket_pool = socketpool.SocketPool(wifi.radio)
+    return _socket_pool
+
+
+def _get_ssl_context():
+    global _ssl_context
+    if _ssl_context is None:
+        try:
+            _ssl_context = ssl.create_default_context() if ssl else None
+        except Exception:
+            _ssl_context = None
+    return _ssl_context
+
 
 class HttpResponse:
     def __init__(self, text: str, content: bytes, status_code: int = 0, headers=None) -> None:
@@ -149,12 +171,39 @@ class HttpClient:
             _set_io_active(False)
             return
         req = self._queue.pop(0)
-        print("HTTP start:", req.key)
+        close_requested = False
+        try:
+            close_requested = (
+                req.headers and str(req.headers.get("Connection", "")).lower() == "close"
+            )
+        except Exception:
+            close_requested = False
+        auth_header = False
+        try:
+            auth_header = bool(req.headers and req.headers.get("Authorization"))
+        except Exception:
+            auth_header = False
+        print(
+            "HTTP start:",
+            req.key,
+            req.method,
+            "timeout",
+            req.timeout,
+            "close",
+            close_requested,
+            "auth",
+            auth_header,
+        )
+        _log_network_state()
         _set_io_active(True)
         try:
             if adafruit_requests is None or socketpool is None or wifi is None:
                 raise RuntimeError("adafruit_requests unavailable")
-            session = self._get_session()
+            fresh_session = False
+            if close_requested:
+                fresh_session = True
+                self._close_session()
+            session = self._create_session() if fresh_session else self._get_session()
             if req.on_progress:
                 req.on_progress()
             headers = {
@@ -196,22 +245,44 @@ class HttpClient:
                 if req.on_progress:
                     req.on_progress()
         except Exception as exc:
-            print("HTTP error:", req.key, repr(exc))
+            print("HTTP error:", req.key, repr(exc), _describe_errno(exc))
+            _log_network_state(prefix="HTTP error")
+            try:
+                self._close_session()
+            except Exception:
+                pass
             if req.on_error:
                 req.on_error(exc)
         finally:
+            try:
+                if req.headers and str(req.headers.get("Connection", "")).lower() == "close":
+                    self._close_session()
+            except Exception:
+                pass
             self._pending_keys.discard(req.key)
             _set_io_active(False)
 
     def _get_session(self):
         if self._session is None:
-            pool = socketpool.SocketPool(wifi.radio)
-            try:
-                ssl_context = ssl.create_default_context() if ssl else None
-            except Exception:
-                ssl_context = None
-            self._session = adafruit_requests.Session(pool, ssl_context)
+            self._session = self._create_session()
         return self._session
+
+    def _create_session(self):
+        pool = _get_socket_pool()
+        ssl_context = _get_ssl_context()
+        return adafruit_requests.Session(pool, ssl_context)
+
+    def _close_session(self) -> None:
+        if self._session is None:
+            return
+        session = self._session
+        self._session = None
+        try:
+            close_fn = getattr(session, "close", None)
+            if close_fn:
+                close_fn()
+        except Exception:
+            pass
 
     def _log_ignored(self, key: str) -> None:
         now = time.monotonic()
@@ -231,6 +302,64 @@ def _set_io_active(active: bool) -> None:
         io_indicator.set_active(active)
     except Exception:
         pass
+
+
+def _log_network_state(prefix: str = "HTTP") -> None:
+    if wifi is None:
+        print("{} network: wifi unavailable".format(prefix))
+        return
+    try:
+        ip = wifi.radio.ipv4_address
+    except Exception:
+        ip = None
+    try:
+        connected = wifi.radio.connected
+    except Exception:
+        connected = None
+    ssid = None
+    rssi = None
+    channel = None
+    try:
+        ap_info = wifi.radio.ap_info
+        if ap_info:
+            ssid = getattr(ap_info, "ssid", None)
+            rssi = getattr(ap_info, "rssi", None)
+            channel = getattr(ap_info, "channel", None)
+    except Exception:
+        pass
+    parts = ["ip={}".format(ip), "connected={}".format(connected)]
+    if ssid is not None:
+        parts.append("ssid={}".format(ssid))
+    if rssi is not None:
+        parts.append("rssi={}".format(rssi))
+    if channel is not None:
+        parts.append("channel={}".format(channel))
+    print("{} network: {}".format(prefix, " ".join(parts)))
+
+
+def _describe_errno(exc: Exception) -> str:
+    code = getattr(exc, "errno", None)
+    if code is None:
+        try:
+            if exc.args and isinstance(exc.args[0], int):
+                code = exc.args[0]
+        except Exception:
+            code = None
+    if code is None:
+        return ""
+    name = ""
+    try:
+        import errno as _errno
+
+        for key, value in _errno.__dict__.items():
+            if key.isupper() and value == code:
+                name = key
+                break
+    except Exception:
+        name = ""
+    if name:
+        return "errno={} {}".format(code, name)
+    return "errno={}".format(code)
 
 
 def _decode_body(data: bytes, headers: Dict[str, str]) -> str:

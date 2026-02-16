@@ -6,6 +6,10 @@ except ImportError:
 
 import board
 import digitalio
+try:
+    import microcontroller
+except Exception:
+    microcontroller = None
 
 
 def resolve_pin(pin_name):
@@ -25,19 +29,24 @@ class Button:
         pin,
         name: str = "Button",
         hold_seconds: float = 3.0,
+        long_hold_seconds: float = 5.0,
         active_low: bool = True,
         on_click=None,
         on_hold=None,
+        on_long_hold=None,
     ) -> None:
         self.pin = pin
         self.name = name or "Button"
         self.hold_seconds = hold_seconds
+        self.long_hold_seconds = long_hold_seconds
         self.active_low = active_low
         self.on_click = on_click
         self.on_hold = on_hold
+        self.on_long_hold = on_long_hold
         self._pressed = False
         self._press_start = None
         self._hold_fired = False
+        self._long_hold_fired = False
 
         self.io = digitalio.DigitalInOut(pin)
         self.io.direction = digitalio.Direction.INPUT
@@ -71,24 +80,35 @@ class Button:
             self._pressed = True
             self._press_start = now
             self._hold_fired = False
+            self._long_hold_fired = False
 
         if pressed and self._pressed:
             if (
-                not self._hold_fired
+                not self._long_hold_fired
                 and self._press_start is not None
-                and (now - self._press_start) >= self.hold_seconds
+                and self.long_hold_seconds is not None
+                and (now - self._press_start) >= float(self.long_hold_seconds)
             ):
-                self._hold_fired = True
-                if self.on_hold:
-                    self.on_hold()
+                self._long_hold_fired = True
+                if self.on_long_hold:
+                    self.on_long_hold()
 
         if not pressed and self._pressed:
-            if not self._hold_fired:
-                if self.on_click:
-                    self.on_click()
+            if not self._long_hold_fired:
+                if (
+                    self._press_start is not None
+                    and self.hold_seconds is not None
+                    and (now - self._press_start) >= float(self.hold_seconds)
+                ):
+                    if self.on_hold:
+                        self.on_hold()
+                else:
+                    if self.on_click:
+                        self.on_click()
             self._pressed = False
             self._press_start = None
             self._hold_fired = False
+            self._long_hold_fired = False
 
     def deinit(self) -> None:
         try:
@@ -103,6 +123,7 @@ class ButtonController:
         button1_pin_name,
         button2_pin_name,
         hold_seconds: float = 3.0,
+        long_hold_seconds: float = 5.0,
         active_low: bool = True,
         status_led=None,
         combo_hold_seconds: float = 1.0,
@@ -127,18 +148,22 @@ class ButtonController:
                 button1_pin,
                 name="Button 1",
                 hold_seconds=hold_seconds,
+                long_hold_seconds=long_hold_seconds,
                 active_low=active_low,
                 on_click=self._button1_click,
                 on_hold=self._button1_hold,
+                on_long_hold=self._button1_long_hold,
             )
         if button2_pin is not None:
             self.button2 = Button(
                 button2_pin,
                 name="Button 2",
                 hold_seconds=hold_seconds,
+                long_hold_seconds=long_hold_seconds,
                 active_low=active_low,
                 on_click=self._button2_click,
                 on_hold=self._button2_hold,
+                on_long_hold=self._button2_long_hold,
             )
 
     def _button1_click(self) -> None:
@@ -162,10 +187,19 @@ class ButtonController:
     def _button2_hold(self) -> None:
         if self._suppress_actions:
             return
-        self.display_enabled = not self.display_enabled
-        self.display_toggle_requested = True
-        state = "on" if self.display_enabled else "off"
-        print("Button 2 hold -> display", state)
+        print("Button 2 hold")
+
+    def _button1_long_hold(self) -> None:
+        if self._suppress_actions:
+            return
+        print("Button 1 long hold -> reset")
+        if microcontroller is not None:
+            microcontroller.reset()
+
+    def _button2_long_hold(self) -> None:
+        if self._suppress_actions:
+            return
+        print("Button 2 long hold")
 
     def update(self, now=None) -> bool:
         if now is None:

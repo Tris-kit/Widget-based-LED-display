@@ -1,5 +1,6 @@
 import json
 import time
+import sys
 
 try:
     import displayio
@@ -10,6 +11,7 @@ from local.errors import DisplayError
 from api.http_client import HttpClient
 from local.wifi import connect_wifi
 from local.hardware.led import init_status_led, toggle_led
+from local.hardware.brightness_knob import BrightnessKnobController
 from local.hardware.button import ButtonController
 from local.ui import io_indicator
 from local.ui.display_helpers import build_error_group, init_panel
@@ -19,25 +21,81 @@ from widgets.spotify_now_playing import SpotifyNowPlayingWidget
 
 print("Started v2")
 
+# --- Fatal error logging ---
+_ERROR_LOG_PATH = "error.log"
+
+
+def _write_fatal_log(context: str, exc: Exception = None) -> None:
+    try:
+        with open(_ERROR_LOG_PATH, "a") as fh:
+            fh.write("\n---\n")
+            fh.write("context: {}\n".format(context or "fatal"))
+            try:
+                timestamp = time.time()
+                fh.write("timestamp: {}\n".format(timestamp))
+            except Exception:
+                fh.write("timestamp: unknown\n")
+            if exc is not None:
+                fh.write("error: {}\n".format(repr(exc)))
+                try:
+                    sys.print_exception(exc, fh)
+                except Exception:
+                    try:
+                        import traceback
+
+                        traceback.print_exception(exc, file=fh)
+                    except Exception:
+                        fh.write("traceback: unavailable\n")
+    except Exception as log_exc:
+        print("Error log write failed:", repr(log_exc))
+
+
+_orig_excepthook = getattr(sys, "excepthook", None)
+
+
+def _fatal_excepthook(exc_type, exc, tb) -> None:
+    _write_fatal_log("uncaught exception", exc)
+    if _orig_excepthook:
+        try:
+            _orig_excepthook(exc_type, exc, tb)
+        except Exception:
+            pass
+
+
+try:
+    sys.excepthook = _fatal_excepthook
+except Exception:
+    pass
+
 # --- Display setup ---
 panel = None
 layout = None
 panel_ok = False
 root_group = None
 content_group = None
-try:
-    panel, layout = init_panel()
-    panel_ok = True
-    if panel and displayio is not None:
-        root_group = displayio.Group()
-        content_group = displayio.Group()
-        root_group.append(content_group)
-        indicator_tile = io_indicator.init_indicator(width=64, height=64, color=0x00FF00)
-        if indicator_tile is not None:
-            root_group.append(indicator_tile)
-        panel.show(root_group)
-except Exception as exc:
-    print("RGB panel init failed:", exc)
+
+
+def _setup_display(bit_depth: int = 6, rgb_pins=None) -> bool:
+    global panel, layout, panel_ok, root_group, content_group
+    try:
+        panel, layout = init_panel(bit_depth=bit_depth, rgb_pins=rgb_pins)
+        panel_ok = True
+        if panel and displayio is not None:
+            root_group = displayio.Group()
+            content_group = displayio.Group()
+            root_group.append(content_group)
+            indicator_tile = io_indicator.init_indicator(width=64, height=64, color=0x00FF00)
+            if indicator_tile is not None:
+                root_group.append(indicator_tile)
+            panel.show(root_group)
+        return True
+    except Exception as exc:
+        print("RGB panel init failed:", exc)
+        panel_ok = False
+        return False
+
+
+_setup_display()
 
 # --- Status LED ---
 status_led = None
@@ -85,6 +143,7 @@ def _set_content_group(group) -> None:
 def _show_error_forever(lines=None, exc: Exception = None) -> None:
     if exc is not None:
         _log_exception("Fatal error", exc)
+    _write_fatal_log("fatal screen", exc)
     error_group = None
     while True:
         if panel and layout:
@@ -128,7 +187,6 @@ temperature_unit = str(config.get("temperature_unit", "fahrenheit"))
 time_to_stop = config.get("time_to_stop", 5)
 refresh_seconds = int(config.get("refresh_seconds", 30))
 request_timeout = int(config.get("request_timeout_seconds", 20))
-display_brightness = config.get("display_brightness", 1.0)
 spotify_client_id = config.get("spotify_client_id", "")
 spotify_client_secret = config.get("spotify_client_secret", "")
 spotify_refresh_token = config.get("spotify_refresh_token", "")
@@ -138,11 +196,17 @@ spotify_request_timeout = int(config.get("spotify_request_timeout_seconds", requ
 spotify_art_path = config.get("spotify_art_path", "spotify_art.bmp")
 button1_pin_name = config.get("button1_pin", "GP14")
 button2_pin_name = config.get("button2_pin", "GP15")
+
+panel_bit_depth = int(config.get("panel_bit_depth", 6))
+panel_rgb_pins = config.get("rgb_pins")
+if panel_rgb_pins:
+    _setup_display(bit_depth=panel_bit_depth, rgb_pins=panel_rgb_pins)
 button_active_low = bool(config.get("button_active_low", True))
 button_hold_seconds = config.get("button_hold_seconds", 0.5)
 announcement_rotation = int(config.get("announcement_duration_seconds", 10))
 announcements_config = config.get("announcements") or []
 announcement_text_color = config.get("announcement_text_color")
+start_widget = str(config.get("start_widget", "spotify")).strip().lower()
 
 
 def _coerce_int(value, default: int) -> int:
@@ -165,14 +229,22 @@ try:
 except Exception as exc:
     print("Button init failed:", repr(exc))
 
+brightness_knob = None
+brightness_poll_s = 0.2
+next_brightness_poll = 0.0
+
 
 # --- Core services (Wi-Fi + API clients) ---
 try:
     try:
-        if panel is not None:
-            panel.set_brightness(display_brightness)
+        brightness_knob = BrightnessKnobController("GP26")
+        if brightness_knob.available and panel is not None:
+            value, changed, raw = brightness_knob.read_brightness()
+            panel.set_brightness(value)
+            if changed:
+                print("Brightness knob:", raw, "->", value)
     except Exception as exc:
-        print("Brightness set failed:", repr(exc))
+        print("Brightness knob init failed:", repr(exc))
     if not muni_api_token or muni_api_token == "YOUR_511_API_TOKEN":
         raise DisplayError("Missing API token.", ["Set API token", "in config.json"])
 
@@ -216,7 +288,14 @@ try:
     )
 
     widgets = [announcements_widget, train_widget, spotify_widget]
-    active_widget_index = 0
+    start_map = {
+        "announcements": 0,
+        "announcement": 0,
+        "train": 1,
+        "trains": 1,
+        "spotify": 2,
+    }
+    active_widget_index = start_map.get(start_widget, 2)
 except DisplayError as exc:
     print("Startup error:", repr(exc))
     _show_error_forever(exc.lines, exc=exc)
@@ -278,6 +357,17 @@ while True:
             widget_event = button_controller.consume_widget_event()
             if widget_event and hasattr(widget, "handle_button"):
                 widget.handle_button(widget_event)
+
+        if brightness_knob is not None and brightness_knob.available and panel is not None:
+            if now >= next_brightness_poll:
+                next_brightness_poll = now + brightness_poll_s
+                try:
+                    value, changed, raw = brightness_knob.read_brightness()
+                    if changed:
+                        print("Brightness knob:", raw, "->", value)
+                        panel.set_brightness(value)
+                except Exception as exc:
+                    print("Brightness knob read failed:", repr(exc))
 
         widget.update(now)
 

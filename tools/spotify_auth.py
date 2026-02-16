@@ -6,7 +6,7 @@ Usage:
   python3 tools/spotify_auth.py \
     --client-id YOUR_ID \
     --client-secret YOUR_SECRET \
-    --redirect-uri http://localhost:8888/callback \
+    --redirect-uri http://127.0.0.1:8888/callback \
     --scopes user-read-currently-playing \
     --write-config \
     --config-path pi_files/config.json
@@ -86,7 +86,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--client-secret", required=True, help="Spotify Client Secret")
     parser.add_argument(
         "--redirect-uri",
-        default="http://localhost:15298/callback.php",
+        default="http://127.0.0.1:15298/callback",
         help="Redirect URI configured in Spotify developer dashboard",
     )
     parser.add_argument(
@@ -143,7 +143,7 @@ def main() -> int:
     args = _parse_args()
     redirect = urlparse(args.redirect_uri)
     if not redirect.hostname or not redirect.port:
-        print("Redirect URI must include host and port, e.g. http://localhost:8888/callback")
+        print("Redirect URI must include host and port, e.g. http://127.0.0.1:8888/callback")
         return 1
 
     state = secrets.token_urlsafe(16)

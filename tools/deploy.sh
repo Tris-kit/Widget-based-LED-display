@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./deploy.sh [--force] [--skip-spotify-auth] [--spotify-config path] [/Volumes/CIRCUITPY]
+# Usage: ./deploy.sh [--force] [--skip-spotify-auth] [--spotify-config path] [--start-imgproxy] [/Volumes/CIRCUITPY]
 # Spotify auth runs by default; use --skip-spotify-auth to bypass.
 TARGET="/Volumes/CIRCUITPY"
 FORCE=0
 SKIP_SPOTIFY_AUTH=0
 SPOTIFY_CONFIG=""
+START_IMGPROXY=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --force)
@@ -20,6 +21,10 @@ while [ "$#" -gt 0 ]; do
     --spotify-config)
       SPOTIFY_CONFIG="$2"
       shift 2
+      ;;
+    --start-imgproxy)
+      START_IMGPROXY=1
+      shift
       ;;
     *)
       TARGET="$1"
@@ -35,15 +40,194 @@ fi
 GIF_DIR_DEFAULT="$PI_DIR/images"
 GIF_DIR_ALT="$PI_DIR/images/gif"
 GIF_DIR_ALT2="$PI_DIR/images/gifs"
+IMAGE_STAMP_FILE="$PROJECT_DIR/.deploy_images_stamp"
 
+# log: consistent, prefixed output so deploy progress is easy to scan.
 log() {
   printf "[deploy] %s\n" "$1"
 }
 
+# ensure_target_writable: verify CIRCUITPY is mounted and writeable.
+# CircuitPython mounts read-only when the USB drive is visible, so we prompt
+# for an eject/power-cycle to regain write access before copying files.
+ensure_target_writable() {
+  local attempts=0
+  while true; do
+    if [ ! -d "$TARGET" ]; then
+      log "Target not found: $TARGET"
+      log "If boot.py disables USB storage, temporarily enable it and reboot."
+      log "Then re-run deploy or press Enter to retry."
+    else
+      if touch "$TARGET/.deploy_write_test" 2>/dev/null; then
+        rm -f "$TARGET/.deploy_write_test"
+        log "Target is mounted read-write: $TARGET"
+        return 0
+      fi
+      log "Target is mounted read-only: $TARGET"
+      if command -v diskutil >/dev/null 2>&1; then
+        log "Attempting to unmount via diskutil..."
+        diskutil unmount "$TARGET" >/dev/null 2>&1 || true
+      fi
+      log "Please recycle the Pico while holding the main control button, then press Enter to retry."
+    fi
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 5 ]; then
+      log "Giving up after $attempts attempts."
+      exit 1
+    fi
+    read -r -p "[deploy] Press Enter to retry (attempt $attempts/5)..." _resp
+  done
+}
+
+# detect_lan_ip: best-effort host LAN IP detection (macOS first, then Linux).
+# Used to rewrite spotify_image_proxy so the Pico can reach the host via LAN.
+detect_lan_ip() {
+  local ip=""
+  if command -v ipconfig >/dev/null 2>&1; then
+    local iface
+    iface=$(route get default 2>/dev/null | awk '/interface:/{print $2}' | head -n 1)
+    if [ -n "$iface" ]; then
+      ip=$(ipconfig getifaddr "$iface" 2>/dev/null || true)
+    fi
+    if [ -z "$ip" ]; then
+      for candidate in en0 en1; do
+        ip=$(ipconfig getifaddr "$candidate" 2>/dev/null || true)
+        if [ -n "$ip" ]; then
+          break
+        fi
+      done
+    fi
+  fi
+  if [ -z "$ip" ] && command -v hostname >/dev/null 2>&1; then
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  fi
+  if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
+    ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')
+  fi
+  if [ -n "$ip" ]; then
+    printf "%s" "$ip"
+    return 0
+  fi
+  return 1
+}
+
+# update_proxy_url: rewrite spotify_image_proxy if it points to loopback.
+# Pico can't reach localhost/127.0.0.1 on the host, so we swap in LAN IP.
+update_proxy_url() {
+  local config_path="$PI_DIR/config.json"
+  if [ ! -f "$config_path" ]; then
+    return 0
+  fi
+  local ip
+  ip=$(detect_lan_ip) || {
+    log "Could not detect LAN IP; leaving spotify_image_proxy unchanged."
+    return 0
+  }
+  python3 - "$config_path" "$ip" <<'PY'
+import json
+import sys
+from urllib.parse import urlparse, urlunparse
+
+path = sys.argv[1]
+ip = sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(0)
+
+url = (data.get("spotify_image_proxy") or "").strip()
+if not url:
+    sys.exit(0)
+
+parsed = urlparse(url)
+host = parsed.hostname or ""
+if host in ("localhost", "127.0.0.1", "::1"):
+    netloc = ip
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    new_url = urlunparse(parsed._replace(netloc=netloc))
+    data["spotify_image_proxy"] = new_url
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    print(f"[deploy] Updated spotify_image_proxy -> {new_url}")
+PY
+}
+
+# check_image_proxy: verify spotify_image_proxy is reachable.
+check_image_proxy() {
+  ensure_tool python3
+  if [ ! -f "$SPOTIFY_CONFIG" ]; then
+    log "Config not found: $SPOTIFY_CONFIG (skipping image proxy check)"
+    return 0
+  fi
+  local proxy_url
+  proxy_url="$(python3 - "$SPOTIFY_CONFIG" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    data = {}
+
+value = (data.get("spotify_image_proxy") or "").strip()
+print(value)
+PY
+)"
+  if [ -z "$proxy_url" ]; then
+    log "spotify_image_proxy not set; skipping image proxy check."
+    return 0
+  fi
+  python3 - "$proxy_url" <<'PY'
+import socket
+import sys
+from urllib.parse import urlparse
+
+url = sys.argv[1]
+parsed = urlparse(url)
+host = parsed.hostname or ""
+if not host:
+    print("[deploy] Could not parse spotify_image_proxy host; skipping check.")
+    sys.exit(0)
+port = parsed.port
+if port is None:
+    port = 443 if parsed.scheme == "https" else 80
+
+sock = socket.socket()
+sock.settimeout(2.0)
+try:
+    sock.connect((host, port))
+    print(f"[deploy] Image proxy is up and running at {host}:{port}")
+except Exception as exc:
+    print(f"[deploy] Image proxy not reachable at {host}:{port} ({exc.__class__.__name__})")
+finally:
+    try:
+        sock.close()
+    except Exception:
+        pass
+PY
+}
+
+# start_imgproxy: optionally run imgproxy for local album art resizing.
+start_imgproxy() {
+  if [ "$START_IMGPROXY" -ne 1 ]; then
+    return 0
+  fi
+  log "Starting imgproxy on http://127.0.0.1:8080 (ctrl+c to stop)."
+  docker run -p 8080:8080 -it ghcr.io/imgproxy/imgproxy:latest
+}
+
+start_imgproxy
+
+# file_size: return file size in bytes (macOS/Linux compatible).
 file_size() {
   stat -f%z "$1" 2>/dev/null || stat -c%s "$1"
 }
 
+# format_bytes: human-readable byte formatting for progress logs.
 format_bytes() {
   local bytes=$1
   local units=(B KB MB GB)
@@ -56,6 +240,7 @@ format_bytes() {
   printf "%s%s" "$value" "${units[$i]}"
 }
 
+# progress_bar: prints a simple inline progress indicator for sync operations.
 progress_bar() {
   local current=$1
   local total=$2
@@ -80,6 +265,7 @@ progress_bar() {
   printf "] %d/%d (%d%%)%s %ss" "$current" "$total" "$percent" "$bytes_info" "$elapsed"
 }
 
+# files_need_copy: detects whether a file should be copied (size/contents/force).
 files_need_copy() {
   local src=$1
   local dst=$2
@@ -104,6 +290,7 @@ files_need_copy() {
   return 1
 }
 
+# copy_file_if_changed: copy a single file only when content differs.
 copy_file_if_changed() {
   local src=$1
   local dst=$2
@@ -121,6 +308,7 @@ copy_file_if_changed() {
   fi
 }
 
+# sync_tree_with_progress: sync a directory tree with deletes + progress.
 sync_tree_with_progress() {
   local src=$1
   local dst=$2
@@ -196,6 +384,7 @@ sync_tree_with_progress() {
   printf "\n\n"
 }
 
+# spinner: show a spinner for long-running steps.
 spinner() {
   local pid=$1
   local msg=$2
@@ -210,6 +399,7 @@ spinner() {
   printf "\b✓\n\n"
 }
 
+# run_step: execute a command with a spinner + label.
 run_step() {
   local msg=$1
   shift
@@ -219,6 +409,7 @@ run_step() {
   wait "$pid"
 }
 
+# ensure_tool: verify an external tool exists before running conversions.
 ensure_tool() {
   local tool=$1
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -227,6 +418,7 @@ ensure_tool() {
   fi
 }
 
+# detect_gif_dir: find GIF directory within images (supports legacy paths).
 detect_gif_dir() {
   if [ -d "$GIF_DIR_ALT" ]; then
     printf "%s" "$GIF_DIR_ALT"
@@ -239,6 +431,58 @@ detect_gif_dir() {
   printf "%s" "$GIF_DIR_DEFAULT"
 }
 
+# images_fingerprint: hash GIF names/sizes/mtimes to detect changes quickly.
+images_fingerprint() {
+  local src_dir=$1
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  python3 - "$src_dir" <<'PY'
+import hashlib
+import os
+import sys
+
+root = sys.argv[1]
+if not os.path.isdir(root):
+    sys.exit(0)
+
+paths = []
+for base, _, files in os.walk(root):
+    for name in files:
+        if name.lower().endswith(".gif"):
+            paths.append(os.path.join(base, name))
+
+paths.sort()
+if not paths:
+    sys.exit(0)
+
+h = hashlib.sha1()
+for path in paths:
+    try:
+        st = os.stat(path)
+    except Exception:
+        continue
+    rel = os.path.relpath(path, root)
+    h.update(rel.encode())
+    h.update(str(st.st_size).encode())
+    h.update(str(int(st.st_mtime)).encode())
+
+print(h.hexdigest())
+PY
+}
+
+# target_images_missing: returns 0 if images folder is missing or empty.
+target_images_missing() {
+  if [ ! -d "$TARGET/images" ]; then
+    return 0
+  fi
+  if find "$TARGET/images" -type f -name "*.bmp" -print -quit | grep -q .; then
+    return 1
+  fi
+  return 0
+}
+
+# count_gif_frames: count frames so we can report conversion progress.
 count_gif_frames() {
   local gif=$1
   local frames=""
@@ -256,6 +500,7 @@ count_gif_frames() {
   printf "%s" "$frames"
 }
 
+# convert_gifs_to_bmp: convert GIF animations to BMP frames for displayio.
 convert_gifs_to_bmp() {
   local src_dir=$1
   local out_dir=$2
@@ -294,6 +539,7 @@ tile=1x${frames}" \
   fi
 }
 
+# run_spotify_auth: perform OAuth flow to refresh the Spotify token.
 run_spotify_auth() {
   if [ "$SKIP_SPOTIFY_AUTH" -eq 1 ]; then
     return 0
@@ -344,7 +590,7 @@ PY
     exit 1
   fi
 
-  local redirect="${SPOTIFY_REDIRECT_URI:-http://localhost:15298/callback.php}"
+  local redirect="${SPOTIFY_REDIRECT_URI:-http://127.0.0.1:15298/callback}"
   local scopes="${SPOTIFY_SCOPES:-user-read-currently-playing}"
   local timeout="${SPOTIFY_TIMEOUT:-180}"
   log "Running Spotify auth flow (open the printed URL to authorize)"
@@ -358,14 +604,18 @@ PY
     --config-path "$SPOTIFY_CONFIG"
 }
 
+ensure_target_writable
+
+if [ -f "$TARGET/error.log" ]; then
+  log "Removing $TARGET/error.log"
+  rm -f "$TARGET/error.log"
+fi
+
+check_image_proxy
+
 run_spotify_auth
 
-if [ ! -d "$TARGET" ]; then
-  log "Target not found: $TARGET"
-  log "Pass the CIRCUITPY mount path as an argument, e.g.:"
-  log "  ./deploy.sh /Volumes/CIRCUITPY"
-  exit 1
-fi
+update_proxy_url
 
 sync_tree_with_progress "$PI_DIR/lib" "$TARGET/lib"
 sync_tree_with_progress "$PI_DIR/api" "$TARGET/api"
@@ -376,19 +626,32 @@ if [ -d "$PI_DIR/announcements" ]; then
 fi
 if [ -d "$PI_DIR/images" ]; then
   GIF_DIR="$(detect_gif_dir)"
-  ensure_tool ffmpeg
-  ensure_tool ffprobe
-  TMP_BMP_DIR="$(mktemp -d "/tmp/ledmatrix_bmp.XXXXXX")"
-  log "Converting GIFs in $GIF_DIR"
-  convert_gifs_to_bmp "$GIF_DIR" "$TMP_BMP_DIR"
-  if find "$TMP_BMP_DIR" -type f -name "*.bmp" -print -quit | grep -q .; then
-    sync_tree_with_progress "$TMP_BMP_DIR" "$TARGET/images"
+  image_stamp="$(images_fingerprint "$GIF_DIR" || true)"
+  if [ -z "$image_stamp" ]; then
+    log "No GIFs found in $GIF_DIR"
+  elif [ "$FORCE" -eq 0 ] && [ -f "$IMAGE_STAMP_FILE" ] \
+      && [ "$(cat "$IMAGE_STAMP_FILE")" = "$image_stamp" ] \
+      && ! target_images_missing; then
+    log "Images unchanged; skipping GIF conversion + sync."
   else
-    log "No BMPs generated; skipping image sync."
+    ensure_tool ffmpeg
+    ensure_tool ffprobe
+    TMP_BMP_DIR="$(mktemp -d "/tmp/ledmatrix_bmp.XXXXXX")"
+    log "Converting GIFs in $GIF_DIR"
+    convert_gifs_to_bmp "$GIF_DIR" "$TMP_BMP_DIR"
+    if find "$TMP_BMP_DIR" -type f -name "*.bmp" -print -quit | grep -q .; then
+      sync_tree_with_progress "$TMP_BMP_DIR" "$TARGET/images"
+    else
+      log "No BMPs generated; skipping image sync."
+    fi
+    rm -rf "$TMP_BMP_DIR"
+    echo "$image_stamp" > "$IMAGE_STAMP_FILE"
   fi
-  rm -rf "$TMP_BMP_DIR"
 fi
 copy_file_if_changed "$PI_DIR/config.json" "$TARGET/config.json" "config.json"
+if [ -f "$PI_DIR/boot.py" ]; then
+  copy_file_if_changed "$PI_DIR/boot.py" "$TARGET/boot.py" "boot.py"
+fi
 copy_file_if_changed "$PI_DIR/main.py" "$TARGET/code.py" "main.py -> code.py"
 
 log "Deploy complete: $TARGET"

@@ -258,6 +258,7 @@ def _pick_image_url(images, target_size: int = 64) -> str:
     """Pick the album art URL closest to the target size."""
     if not isinstance(images, list) or not images:
         return ""
+    _log_album_images(images)
     best_url = ""
     best_score = None
     for img in images:
@@ -276,6 +277,24 @@ def _pick_image_url(images, target_size: int = 64) -> str:
     if best_url:
         return best_url
     return images[0].get("url") or ""
+
+
+def _log_album_images(images) -> None:
+    for img in images:
+        if not isinstance(img, dict):
+            continue
+        url = img.get("url") or ""
+        if not url:
+            continue
+        try:
+            width = int(img.get("width") or 0)
+        except Exception:
+            width = 0
+        try:
+            height = int(img.get("height") or 0)
+        except Exception:
+            height = 0
+        print("Spotify album image: {}x{} {}".format(width, height, url))
 
 
 def _basic_auth_header(client_id: str, client_secret: str) -> str:

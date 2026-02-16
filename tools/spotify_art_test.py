@@ -37,9 +37,9 @@ def url_encode(text: str) -> str:
 def build_proxy_url(proxy_url: str, image_url: str) -> str:
     if "{url}" in proxy_url:
         return proxy_url.replace("{url}", url_encode(image_url))
-    if "?" in proxy_url:
-        return "{}&url={}".format(proxy_url, url_encode(image_url))
-    return "{}?url={}".format(proxy_url, url_encode(image_url))
+    base = (proxy_url or "").rstrip("/")
+    encoded = url_encode(image_url)
+    return "{}/unsafe/resize:fill:64:64:1/plain/{}@bmp".format(base, encoded)
 
 
 def fetch_bytes(url: str, timeout: int = 10) -> Tuple[bytes, int, dict]:
